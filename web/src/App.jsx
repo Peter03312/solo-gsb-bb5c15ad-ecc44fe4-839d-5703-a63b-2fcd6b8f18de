@@ -8,11 +8,13 @@ import Appeal from './components/Appeal.jsx';
 import Publish from './components/Publish.jsx';
 import Stoppages from './components/Stoppages.jsx';
 import Divisions from './components/Divisions.jsx';
+import Penalties from './components/Penalties.jsx';
 
 const TABS = [
   { key: 'results', label: '成绩排名' },
   { key: 'divisions', label: '组别赛道' },
   { key: 'stoppages', label: '停表区间' },
+  { key: 'penalties', label: '罚时裁决' },
   { key: 'appeal', label: '整案申诉' },
   { key: 'review', label: '争议复核' },
   { key: 'import', label: '打卡导入' },

@@ -699,5 +699,233 @@ console.log('11) 组别赛道、选手归属与组内名次');
     all.every(x => 'groupRank' in x && 'divisionCode' in x));
 }
 
+console.log('12) 罚时裁决：批量登记/撤销、正式耗时名次、幂等、冻结');
+{
+  // 12.1 种子含一条有效（002 +60，未完赛）与一条已撤销（003 +30）裁决
+  const p0 = await call('/api/penalties');
+  ok('12.1 /api/penalties 返回种子裁决与审计',
+    p0.status === 200 && p0.body.rulings.some(x => x.rulingNo === 'P-DEMO-01' && x.status === 'active' && x.seconds === 60) &&
+    p0.body.rulings.some(x => x.rulingNo === 'P-DEMO-02' && x.status === 'revoked') &&
+    p0.body.audits.length === 3);
+  const rs0 = await resultsByBib();
+  ok('12.1 未完赛 002 挂有效罚时 60 但 officialElapsed/rank 为空',
+    rs0.get('002').status === 'finish_dnf' && rs0.get('002').penaltySecs === 60 &&
+    rs0.get('002').officialElapsed == null && rs0.get('002').rank == null);
+  ok('12.1 完赛者均带 officialElapsed 字段（=净耗时，无罚时）',
+    rs0.get('001').officialElapsed === rs0.get('001').netElapsed && rs0.get('001').penaltySecs === 0);
+  ok('12.1 已撤销裁决不计入（003 penaltySecs=0）', rs0.get('003').penaltySecs === 0);
+
+  // 12.2 导入三名干净完赛者：110=500s、111=112=600s（净耗时同序；全场另有 090=550 等更快者）
+  const rImp = await rev();
+  const imp = await call('/api/punches/import', { method: 'POST', body: JSON.stringify({ expectedRevision: rImp, punches: [
+    { recordNo: 'Q101', bib: '110', name: '罚时甲', point: 'S', seconds: 0, kind: 'start' },
+    { recordNo: 'Q102', bib: '110', point: 'A1', seconds: 100, kind: 'enroute' },
+    { recordNo: 'Q103', bib: '110', point: 'B1', seconds: 300, kind: 'enroute' },
+    { recordNo: 'Q104', bib: '110', point: 'F', seconds: 500, kind: 'finish' },
+    { recordNo: 'Q111', bib: '111', name: '罚时乙', point: 'S', seconds: 0, kind: 'start' },
+    { recordNo: 'Q112', bib: '111', point: 'A2', seconds: 100, kind: 'enroute' },
+    { recordNo: 'Q113', bib: '111', point: 'B2', seconds: 300, kind: 'enroute' },
+    { recordNo: 'Q114', bib: '111', point: 'F', seconds: 600, kind: 'finish' },
+    { recordNo: 'Q121', bib: '112', name: '罚时丙', point: 'S', seconds: 0, kind: 'start' },
+    { recordNo: 'Q122', bib: '112', point: 'A1', seconds: 100, kind: 'enroute' },
+    { recordNo: 'Q123', bib: '112', point: 'B1', seconds: 300, kind: 'enroute' },
+    { recordNo: 'Q124', bib: '112', point: 'F', seconds: 600, kind: 'finish' },
+  ]})});
+  ok('12.2 三名完赛者导入成功', imp.status === 200 && imp.body.inserted === 12);
+  const before = await resultsByBib();
+  const off110 = before.get('110').officialElapsed;
+  ok('12.2 罚时前 110=500 快于 111/112=600，111 与 112 并列',
+    before.get('110').officialElapsed === 500 &&
+    before.get('111').officialElapsed === 600 && before.get('112').officialElapsed === 600 &&
+    before.get('110').rank < before.get('111').rank &&
+    before.get('111').rank === before.get('112').rank);
+  ok('12.2 默认赛道三人组内名次与全场一致形态',
+    before.get('111').groupRank === before.get('112').groupRank);
+
+  // 12.3 整批拒绝（不写裁决、不留审计、不推进修订）
+  const r0 = await rev();
+  const auditsBefore = (await call('/api/penalties')).body.audits.length;
+  const dupBatch = await call('/api/penalties', { method: 'POST', body: JSON.stringify({ expectedRevision: r0, ops: [
+    { action: 'register', rulingNo: 'PP1', bib: '110', seconds: 10, reason: 'a' },
+    { action: 'register', rulingNo: 'PP1', bib: '110', seconds: 20, reason: 'b' },
+  ]})});
+  ok('12.3 批内重复裁决号 400', dupBatch.status === 400 && /批次内重复/.test(dupBatch.body.error));
+  const unknownRunner = await call('/api/penalties', { method: 'POST', body: JSON.stringify({ expectedRevision: r0, ops: [
+    { action: 'register', rulingNo: 'PP1', bib: '999999', seconds: 10, reason: 'a' },
+  ]})});
+  ok('12.3 未知选手 400', unknownRunner.status === 400 && /未知选手/.test(unknownRunner.body.error));
+  for (const bad of [0, -10, 2.5, '30']) {
+    const rr = await call('/api/penalties', { method: 'POST', body: JSON.stringify({ expectedRevision: r0, ops: [
+      { action: 'register', rulingNo: 'PP1', bib: '110', seconds: bad, reason: 'a' },
+    ]})});
+    ok(`12.3 非法秒数 ${JSON.stringify(bad)} 400`, rr.status === 400 && /正整数/.test(rr.body.error));
+  }
+  const noReason = await call('/api/penalties', { method: 'POST', body: JSON.stringify({ expectedRevision: r0, ops: [
+    { action: 'register', rulingNo: 'PP1', bib: '110', seconds: 10, reason: '   ' },
+  ]})});
+  ok('12.3 缺原因 400', noReason.status === 400);
+  const revokeUnknown = await call('/api/penalties', { method: 'POST', body: JSON.stringify({ expectedRevision: r0, ops: [
+    { action: 'revoke', rulingNo: 'NO-SUCH', reason: 'x' },
+  ]})});
+  ok('12.3 撤销未知裁决 400', revokeUnknown.status === 400 && /不存在/.test(revokeUnknown.body.error));
+  const reuseRevoked = await call('/api/penalties', { method: 'POST', body: JSON.stringify({ expectedRevision: r0, ops: [
+    { action: 'register', rulingNo: 'P-DEMO-02', bib: '110', seconds: 10, reason: '重新登记' },
+  ]})});
+  ok('12.3 撤销后裁决号复用 400', reuseRevoked.status === 400 && /不可复用/.test(reuseRevoked.body.error));
+  const stale = await call('/api/penalties', { method: 'POST', body: JSON.stringify({ expectedRevision: r0 + 999, ops: [
+    { action: 'register', rulingNo: 'PP1', bib: '110', seconds: 10, reason: 'a' },
+  ]})});
+  ok('12.3 过期修订 409 带 currentRevision', stale.status === 409 && stale.body.currentRevision === r0);
+  const noRev = await call('/api/penalties', { method: 'POST', body: JSON.stringify({ ops: [] })});
+  ok('12.3 缺 expectedRevision / 空批次 400', noRev.status === 400);
+  // 混批中一条非法 => 整批拒绝，另一条不得生效
+  const mixed = await call('/api/penalties', { method: 'POST', body: JSON.stringify({ expectedRevision: r0, ops: [
+    { action: 'register', rulingNo: 'PP-OK', bib: '110', seconds: 10, reason: 'a' },
+    { action: 'register', rulingNo: 'PP-BAD', bib: '999999', seconds: 10, reason: 'b' },
+  ]})});
+  ok('12.3 混批一条非法整批 400', mixed.status === 400);
+  const after = await call('/api/penalties');
+  ok('12.3 整批拒绝不留裁决/审计、不推进修订',
+    !after.body.rulings.some(x => x.rulingNo === 'PP-OK') &&
+    after.body.audits.length === auditsBefore &&
+    after.body.revision === r0);
+
+  // 12.4 合法整批（混合登记）：110 +100（→600，与 111/112 并列）；原子一次修订
+  const ok1 = await call('/api/penalties', { method: 'POST', body: JSON.stringify({ expectedRevision: r0, ops: [
+    { action: 'register', rulingNo: 'PA1', bib: '110', seconds: 100, reason: '漏点 +100' },
+    { action: 'register', rulingNo: 'PA2', bib: '111', seconds: 15, reason: '晚出发 +15' },
+  ]})});
+  ok('12.4 整批登记成功、修订只 +1、返回 registered=2',
+    ok1.status === 200 && ok1.body.changed === true &&
+    ok1.body.registered === 2 && ok1.body.revoked === 0 && ok1.body.revision === r0 + 1);
+  const r1 = await rev();
+  const rs1 = await resultsByBib();
+  ok('12.4 110 正式 600（净500+100）、111 正式 615、112 正式 600',
+    rs1.get('110').netElapsed === 500 && rs1.get('110').penaltySecs === 100 && rs1.get('110').officialElapsed === 600 &&
+    rs1.get('111').officialElapsed === 615 && rs1.get('112').officialElapsed === 600);
+  ok('12.4 按正式耗时并列：110 与 112 同名次，111 在其后',
+    rs1.get('110').rank === rs1.get('112').rank && rs1.get('111').rank > rs1.get('112').rank &&
+    rs1.get('110').groupRank === rs1.get('112').groupRank);
+  ok('12.4 结果带裁决明细',
+    JSON.stringify(rs1.get('110').penalties.map(p => [p.rulingNo, p.seconds])) === JSON.stringify([['PA1', 100]]));
+
+  // 12.5 幂等：同号同内容有效裁决重传 => 不留痕、不推进修订
+  const idem = await call('/api/penalties', { method: 'POST', body: JSON.stringify({ expectedRevision: r1, ops: [
+    { action: 'register', rulingNo: 'PA1', bib: '110', seconds: 100, reason: '漏点 +100' },
+    { action: 'register', rulingNo: 'PA2', bib: '111', seconds: 15, reason: '晚出发 +15' },
+  ]})});
+  ok('12.5 同号同内容重传幂等（changed=false、idempotent=2、修订不变）',
+    idem.status === 200 && idem.body.changed === false && idem.body.idempotent === 2 &&
+    idem.body.registered === 0 && idem.body.revision === r1);
+  const conflict = await call('/api/penalties', { method: 'POST', body: JSON.stringify({ expectedRevision: r1, ops: [
+    { action: 'register', rulingNo: 'PA1', bib: '110', seconds: 101, reason: '漏点 +100' },
+  ]})});
+  ok('12.5 同号内容冲突（秒数不同）400', conflict.status === 400 && /内容冲突/.test(conflict.body.error));
+  const conflictBib = await call('/api/penalties', { method: 'POST', body: JSON.stringify({ expectedRevision: r1, ops: [
+    { action: 'register', rulingNo: 'PA1', bib: '111', seconds: 100, reason: '漏点 +100' },
+  ]})});
+  ok('12.5 同号内容冲突（号码布不同）400', conflictBib.status === 400 && /内容冲突/.test(conflictBib.body.error));
+  const conflictReason = await call('/api/penalties', { method: 'POST', body: JSON.stringify({ expectedRevision: r1, ops: [
+    { action: 'register', rulingNo: 'PA1', bib: '110', seconds: 100, reason: '另一个原因' },
+  ]})});
+  ok('12.5 同号内容冲突（原因不同）400', conflictReason.status === 400 && /内容冲突/.test(conflictReason.body.error));
+
+  // 12.6 撤销：原子一批撤销 PA1 + 登记 PA3（112 +20）；110 回到 500，112=620
+  const ok2 = await call('/api/penalties', { method: 'POST', body: JSON.stringify({ expectedRevision: r1, ops: [
+    { action: 'revoke', rulingNo: 'PA1', reason: '申诉成立，撤销罚时' },
+    { action: 'register', rulingNo: 'PA3', bib: '112', seconds: 20, reason: '加罚 20' },
+  ]})});
+  ok('12.6 混合撤销+登记成功、修订只 +1',
+    ok2.status === 200 && ok2.body.registered === 1 && ok2.body.revoked === 1 && ok2.body.revision === r1 + 1);
+  const r2 = await rev();
+  const rs2 = await resultsByBib();
+  ok('12.6 撤销后 110 正式回到 500、112=620',
+    rs2.get('110').officialElapsed === 500 && rs2.get('110').penaltySecs === 0 &&
+    rs2.get('112').officialElapsed === 620 && rs2.get('112').penaltySecs === 20);
+  // 已撤销同原因重撤幂等、异原因冲突；撤销号不可再登记（12.3 已覆盖种子号，这里覆盖本批号）
+  const reRevoke = await call('/api/penalties', { method: 'POST', body: JSON.stringify({ expectedRevision: r2, ops: [
+    { action: 'revoke', rulingNo: 'PA1', reason: '申诉成立，撤销罚时' },
+  ]})});
+  ok('12.6 已撤销同原因重撤幂等', reRevoke.body.changed === false && reRevoke.body.idempotent === 1 && reRevoke.body.revision === r2);
+  const reRevokeDiff = await call('/api/penalties', { method: 'POST', body: JSON.stringify({ expectedRevision: r2, ops: [
+    { action: 'revoke', rulingNo: 'PA1', reason: '不同原因' },
+  ]})});
+  ok('12.6 已撤销异原因重撤 400', reRevokeDiff.status === 400 && /撤销原因冲突/.test(reRevokeDiff.body.error));
+  const reusePA1 = await call('/api/penalties', { method: 'POST', body: JSON.stringify({ expectedRevision: r2, ops: [
+    { action: 'register', rulingNo: 'PA1', bib: '110', seconds: 5, reason: '复用号码' },
+  ]})});
+  ok('12.6 已撤销号码重新登记 400', reusePA1.status === 400 && /不可复用/.test(reusePA1.body.error));
+  const pl2 = await call('/api/penalties');
+  ok('12.6 幂等重撤未新增审计（PA1 审计=登记1+撤销1）',
+    pl2.body.audits.filter(a => a.rulingNo === 'PA1').length === 2);
+  const pa1 = pl2.body.rulings.find(x => x.rulingNo === 'PA1');
+  ok('12.6 PA1 已撤销且保留撤销原因与时间', pa1.status === 'revoked' && /申诉成立/.test(pa1.revokeReason) && !!pa1.revokedAt);
+
+  // 12.7 整案申诉在同一裁决下展示正式耗时；裁决变更使旧预演令牌失效
+  // 把 002 的超时终点 1850 更正为 1800：其身上挂着种子有效裁决 P-DEMO-01（+60）
+  const r3 = await rev();
+  const p002f = (await call('/api/punches?bib=002')).body.punches.find(x => x.record_no === 'R0013');
+  const pv = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r3, operations: [
+    { punchId: p002f.id, action: 'correct', reason: '终点读数更正', newPoint: 'F', newSeconds: 1800 },
+  ]})});
+  const a002 = new Map(pv.body.affected.map(x => [x.bib, x])).get('002');
+  // 此刻停表区间已在第 10 节清空：net=1800、penalty=60、official=1860（断言按实际 stoppedSecs 推导）
+  const expNet002 = 1800 - (a002.after.stoppedSecs || 0);
+  ok('12.7 预演展示同一裁决下 002：净 ' + expNet002 + '、罚时 60、正式 ' + (expNet002 + 60),
+    a002.after.status === 'ok' && a002.after.elapsed === 1800 &&
+    a002.after.netElapsed === expNet002 &&
+    a002.after.penaltySecs === 60 && a002.after.officialElapsed === expNet002 + 60,
+    JSON.stringify(a002?.after));
+  // 他人登记一条罚时推进修订，旧预演必须失效
+  await call('/api/penalties', { method: 'POST', body: JSON.stringify({ expectedRevision: r3, ops: [
+    { action: 'register', rulingNo: 'PB1', bib: '110', seconds: 1, reason: '并行使令牌失效' },
+  ]})});
+  const r4 = await rev();
+  const staleCf = await call('/api/appeals/confirm', { method: 'POST', body: JSON.stringify({ expectedRevision: r4, token: pv.body.token })});
+  ok('12.7 裁决变更后旧预演确认 409', staleCf.status === 409 && staleCf.body.currentRevision === r4);
+  // 撤销 PB1 还原 110
+  await call('/api/penalties', { method: 'POST', body: JSON.stringify({ expectedRevision: r4, ops: [
+    { action: 'revoke', rulingNo: 'PB1', reason: '误登记撤销' },
+  ]})});
+
+  // 12.8 发布冻结裁决、officialElapsed 与名次；之后撤销不改历史
+  const r5 = await rev();
+  const pub = await call('/api/publications', { method: 'POST', body: JSON.stringify({ expectedRevision: r5, note: '罚时冻结版' })});
+  ok('12.8 发布成功', pub.status === 200);
+  const vPen = pub.body.version;
+  const snap = (await call(`/api/publications/${vPen}`)).body;
+  ok('12.8 快照冻结罚时裁决（PA2 有效 +15、PA1 已撤销留痕、PA3 有效 +20）',
+    snap.penalties.rulings.find(x => x.rulingNo === 'PA2').status === 'active' &&
+    snap.penalties.rulings.find(x => x.rulingNo === 'PA2').seconds === 15 &&
+    snap.penalties.rulings.find(x => x.rulingNo === 'PA1').status === 'revoked' &&
+    snap.penalties.rulings.find(x => x.rulingNo === 'PA3').status === 'active');
+  const s111 = snap.results.find(x => x.bib === '111');
+  const s112 = snap.results.find(x => x.bib === '112');
+  const s110 = snap.results.find(x => x.bib === '110');
+  ok('12.8 冻结成绩带 penaltySecs/officialElapsed 且名次按正式耗时',
+    s111.penaltySecs === 15 && s111.officialElapsed === 615 &&
+    s112.penaltySecs === 20 && s112.officialElapsed === 620 &&
+    s110.officialElapsed === 500 &&
+    s110.rank < s111.rank && s111.rank < s112.rank);
+  // 发布后撤销 PA2（111 +15）：实时成绩变化，历史版不变
+  const r6 = await rev();
+  await call('/api/penalties', { method: 'POST', body: JSON.stringify({ expectedRevision: r6, ops: [
+    { action: 'revoke', rulingNo: 'PA2', reason: '发布后撤销，不影响历史' },
+  ]})});
+  const live = await resultsByBib();
+  ok('12.8 撤销后实时 111 罚时清零、正式回到 600',
+    live.get('111').penaltySecs === 0 && live.get('111').officialElapsed === 600);
+  const oldSnap = (await call(`/api/publications/${vPen}`)).body;
+  const old111 = oldSnap.results.find(x => x.bib === '111');
+  const oldPA2 = oldSnap.penalties.rulings.find(x => x.rulingNo === 'PA2');
+  ok('12.8 历史版仍冻结 PA2 有效与 111 正式 615',
+    oldPA2.status === 'active' && old111.penaltySecs === 15 && old111.officialElapsed === 615);
+
+  // 12.9 旧库无裁决按零罚时兼容（由迁移回填保证；此处校验实时结果字段完整）
+  const all = (await call('/api/results')).body.results;
+  ok('12.9 实时结果每项都带 penaltySecs/officialElapsed/penalties 字段',
+    all.every(x => 'penaltySecs' in x && 'officialElapsed' in x && Array.isArray(x.penalties)));
+}
+
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
 process.exit(fail ? 1 : 0);

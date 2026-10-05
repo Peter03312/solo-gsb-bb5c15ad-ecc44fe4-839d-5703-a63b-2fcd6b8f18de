@@ -107,7 +107,35 @@ CREATE TABLE IF NOT EXISTS punch_audit (
   at           TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- 发布快照（冻结，不可变）：同时冻结发布当时的停表区间与组别赛道/归属
+-- 罚时裁决（裁判对选手加罚的秒数；officialElapsed = netElapsed + 有效罚时合计）
+-- ruling_no 全局唯一；撤销后号码永久不可复用（登记被撤销号码整批拒绝）。
+-- status: active（有效，计入正式耗时）| revoked（已撤销，不再计入；留痕保留）
+CREATE TABLE IF NOT EXISTS penalty_ruling (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  ruling_no     TEXT NOT NULL UNIQUE,
+  bib           TEXT NOT NULL REFERENCES runner(bib),
+  seconds       INTEGER NOT NULL CHECK (seconds > 0),
+  reason        TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','revoked')),
+  revoke_reason TEXT,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  revoked_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_penalty_bib ON penalty_ruling(bib);
+
+-- 罚时裁决审计：登记 / 撤销均逐条留痕（整批成功时一次性写入；整批拒绝不写任何一条）
+CREATE TABLE IF NOT EXISTS penalty_audit (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  ruling_no     TEXT NOT NULL,
+  action        TEXT NOT NULL CHECK (action IN ('register','revoke')),
+  bib           TEXT,
+  seconds       INTEGER,
+  reason        TEXT,
+  revoke_reason TEXT,
+  at            TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 发布快照（冻结，不可变）：同时冻结发布当时的停表区间、组别赛道/归属与罚时裁决
 CREATE TABLE IF NOT EXISTS publication (
   version         INTEGER PRIMARY KEY,
   event_revision  INTEGER NOT NULL,
@@ -116,13 +144,15 @@ CREATE TABLE IF NOT EXISTS publication (
   config_json     TEXT NOT NULL,
   stoppages_json  TEXT NOT NULL DEFAULT '[]',
   divisions_json  TEXT NOT NULL DEFAULT '{"divisions":[],"assignments":[]}',
+  penalties_json  TEXT NOT NULL DEFAULT '{"rulings":[],"audits":[]}',
   readings_json   TEXT NOT NULL,
   results_json    TEXT NOT NULL
 );
 
 -- 发布版成绩（便于排名查询），历史版永不被后续更正修改
 -- elapsed=原始耗时；net_elapsed=发布当时按冻结停表区间算出的净耗时（未完赛为 NULL）
--- rank_no=全场净耗时名次；group_rank=同组完赛者中的组内名次（允许并列，未完赛为 NULL）
+-- penalty_secs=冻结的有效罚时合计（未完赛为 0）；official_elapsed=net_elapsed+penalty_secs（未完赛为 NULL）
+-- rank_no=全场正式耗时名次；group_rank=同组完赛者中的组内名次（允许并列，未完赛为 NULL）
 CREATE TABLE IF NOT EXISTS published_result (
   publication_version INTEGER NOT NULL REFERENCES publication(version),
   bib         TEXT NOT NULL,
@@ -130,6 +160,8 @@ CREATE TABLE IF NOT EXISTS published_result (
   status      TEXT NOT NULL,
   elapsed     INTEGER,
   net_elapsed INTEGER,
+  penalty_secs    INTEGER NOT NULL DEFAULT 0,
+  official_elapsed INTEGER,
   fail_at     TEXT,
   detail      TEXT,
   rank_no     INTEGER,

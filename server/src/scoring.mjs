@@ -37,7 +37,30 @@ export function loadConfig(db) {
   const assignments = {};
   for (const r of db.prepare('SELECT bib, division_id FROM runner_division').all())
     assignments[r.bib] = r.division_id;
-  return { ...ev, groups, stoppages, divisions, assignments };
+  // 有效罚时裁决：bib -> 有效裁决数组（已撤销不计）；正式耗时 = 净耗时 + 有效罚时合计
+  const activePenalties = loadActivePenalties(db);
+  return { ...ev, groups, stoppages, divisions, assignments, penalties: activePenalties };
+}
+
+/**
+ * 读取当前所有有效罚时裁决：bib -> [{ rulingNo, seconds, reason }]。
+ * 已撤销裁决（status='revoked'）不参与核算；旧库无裁决表时按零罚时返回（兼容）。
+ */
+export function loadActivePenalties(db) {
+  const byBib = {};
+  const table = db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='penalty_ruling'")
+    .get();
+  if (!table) return byBib;
+  for (const r of db
+    .prepare(
+      `SELECT ruling_no, bib, seconds, reason FROM penalty_ruling
+       WHERE status = 'active' ORDER BY id`
+    )
+    .all()) {
+    (byBib[r.bib] ??= []).push({ rulingNo: r.ruling_no, seconds: r.seconds, reason: r.reason });
+  }
+  return byBib;
 }
 
 /**
@@ -101,34 +124,36 @@ export function computeResults(db, config = loadConfig(db)) {
 
 /**
  * 全场名次 + 组内名次。
- * - rank：全部完赛者按净耗时升序（含并列），无有效链不排名；
- * - groupRank：只在「同组完赛者」中按净耗时排名（允许并列），
+ * - rank：全部完赛者按【正式耗时 officialElapsed = netElapsed + 有效罚时合计】升序（含并列），无有效链不排名；
+ * - groupRank：只在「同组完赛者」中按正式耗时排名（允许并列），
  *   同组 = 归属同一组别；未分组者彼此构成默认赛道组。未完赛者两种名次均为空。
  * 可用于内存中的预演结果。
  */
 export function rankResults(results) {
   const netOf = (r) => (r.netElapsed != null ? r.netElapsed : r.elapsed);
+  // 完赛者按正式耗时排名；旧结果对象缺 officialElapsed 时退回净耗时（兼容）
+  const officialOf = (r) => (r.officialElapsed != null ? r.officialElapsed : netOf(r));
   results.sort((a, b) => {
     if (a.elapsed == null && b.elapsed == null) return a.bib.localeCompare(b.bib);
     if (a.elapsed == null) return 1;
     if (b.elapsed == null) return -1;
-    const na = netOf(a);
-    const nb = netOf(b);
-    if (na !== nb) return na - nb;
+    const oa = officialOf(a);
+    const ob = officialOf(b);
+    if (oa !== ob) return oa - ob;
     return a.bib.localeCompare(b.bib);
   });
-  // 并列名次（按净耗时）
+  // 并列名次（按正式耗时）
   let rank = 0;
-  let prevNet = null;
+  let prevOff = null;
   results.forEach((r, i) => {
     if (r.elapsed != null) {
-      const n = netOf(r);
-      if (n !== prevNet) rank = i + 1;
+      const o = officialOf(r);
+      if (o !== prevOff) rank = i + 1;
       r.rank = rank;
-      prevNet = n;
+      prevOff = o;
     }
   });
-  // 组内名次：同赛道（同组别；未分组者同属默认赛道）完赛者之间按净耗时并列排名
+  // 组内名次：同赛道（同组别；未分组者同属默认赛道）完赛者之间按正式耗时并列排名
   const cohorts = new Map();
   for (const r of results) {
     if (r.elapsed == null) continue; // 未完赛者两种名次均为空
@@ -138,18 +163,18 @@ export function rankResults(results) {
   }
   for (const list of cohorts.values()) {
     list.sort((a, b) => {
-      const na = netOf(a);
-      const nb = netOf(b);
-      if (na !== nb) return na - nb;
+      const oa = officialOf(a);
+      const ob = officialOf(b);
+      if (oa !== ob) return oa - ob;
       return a.bib.localeCompare(b.bib);
     });
     let gRank = 0;
     let gPrev = null;
     list.forEach((r, i) => {
-      const n = netOf(r);
-      if (n !== gPrev) gRank = i + 1;
+      const o = officialOf(r);
+      if (o !== gPrev) gRank = i + 1;
       r.groupRank = gRank;
-      gPrev = n;
+      gPrev = o;
     });
   }
   return results;
@@ -176,12 +201,18 @@ export function computeRunner(db, config, bib, name = null) {
  */
 export function computeRunnerFromReadings(readings, config, bib, name = null) {
   const course = resolveCourse(config, bib);
+  // 该选手当前有效罚时（已撤销裁决不计）；未完赛者也展示裁决，但不产生正式耗时
+  const penalties = (config.penalties && config.penalties[bib]) || [];
+  const penaltySecs = penalties.reduce((n, p) => n + p.seconds, 0);
   const base = {
     bib, name, status: 'ok',
     elapsed: null, // 原始耗时（终点 − 出发秒数），语义不变
     netElapsed: null, // 净耗时 = 原始耗时 − 停表区间并集与[出发,终点]的交长；未完赛者无
     stoppedSecs: null, // 该选手中被扣减的停表秒数
-    rank: null, // 全场净耗时名次（rankResults 统一填写）
+    penaltySecs, // 有效罚时合计（正整数秒）；未完赛者罚时仍列出但不计成绩
+    penalties, // 有效裁决明细 [{ rulingNo, seconds, reason }]
+    officialElapsed: null, // 正式耗时 = 净耗时 + 有效罚时合计；仅完赛者有，排名/并列按它
+    rank: null, // 全场正式耗时名次（rankResults 统一填写）
     groupRank: null, // 同组完赛者中的组内名次（rankResults 统一填写）
     divisionCode: course.division ? course.division.code : null, // 归属组别；null = 未分组（默认赛道）
     divisionName: course.division ? course.division.name : null,
@@ -247,7 +278,9 @@ export function computeRunnerFromReadings(readings, config, bib, name = null) {
   // 净耗时：仅扣减停表区间并集与「出发→终点」区间的交长；重叠区间只计一次。
   const elapsed = finish.seconds - start.seconds;
   const stoppedSecs = overlapLength(config.stoppages || [], start.seconds, finish.seconds);
-  return { ...base, elapsed, stoppedSecs, netElapsed: elapsed - stoppedSecs, chain };
+  const netElapsed = elapsed - stoppedSecs;
+  // 正式耗时 = 净耗时 + 有效罚时合计；rank/groupRank 按正式耗时（允许并列）。
+  return { ...base, elapsed, stoppedSecs, netElapsed, officialElapsed: netElapsed + penaltySecs, chain };
 }
 
 function slim(p) {

@@ -8,6 +8,7 @@ import {
   validateOperations, canonicalOps, signPreview, verifyPreview,
   previewCase, commitCase,
 } from './appeals.mjs';
+import { validatePenaltyOps, commitPenaltyOps, listRulings } from './penalties.mjs';
 import { seedDemo } from './seed.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -363,6 +364,44 @@ app.post('/api/stoppages', (req, res) => {
     stoppages: next.map((s) => ({ startSecs: s.start, endSecs: s.end })),
   });
 });
+
+// ---------- 罚时裁决：批量登记 / 撤销 ----------
+app.get('/api/penalties', (req, res) => {
+  const cfg = loadConfig(db);
+  if (!cfg) return res.json({ configured: false, revision: 0, rulings: [], audits: [], totals: {} });
+  const { rulings, audits, totals } = listRulings(db);
+  res.json({ configured: true, revision: cfg.revision, rulings, audits, totals });
+});
+
+/**
+ * POST /api/penalties 批量登记/撤销罚时裁决（原子生效）：
+ * body: { expectedRevision, ops: [
+ *   { action:'register', rulingNo, bib, seconds（正整数）, reason },
+ *   { action:'revoke',   rulingNo, reason },
+ * ] }
+ * 批内重复裁决号 / 未知选手 / 未知裁决 / 内容冲突 / 非法秒数 / 撤销后复用
+ *   => 400 整批拒绝（不写任何裁决或审计）；修订号过期 => 409 + currentRevision。
+ * 同号同内容的有效裁决重传、已撤销裁决同原因重撤为幂等只读（不留痕、不推进修订）；
+ * 实际变更一次性落库并逐条审计，修订号只推进一次。
+ */
+app.post('/api/penalties', (req, res) => {
+  if (!checkRevision(req, res)) return;
+  if (!loadConfig(db)) return badRequest(res, '赛事尚未配置，请先设置关卡组');
+  const v = validatePenaltyOps(db, req.body?.ops);
+  if (v.error) return badRequest(res, v.error);
+  const result = commitPenaltyOps(db, v.ops, v.effectiveChanges);
+  res.json({
+    ok: true,
+    revision: result.revision,
+    changed: result.changed,
+    registered: result.registered,
+    revoked: result.revoked,
+    // 批内同号同内容重传 / 同原因重撤 => 幂等跳过（不留痕）
+    idempotent: v.ops.length - v.effectiveChanges.length,
+    rulings: result.rulings.rulings,
+    totals: result.rulings.totals,
+  });
+});
 /**
  * 整批校验：负秒数、同记录号异「原始内容」=> 整批拒绝（事务回滚）。
  * 同号判定以该记录号【首次入库时】的原始读数（bib/point/seconds/kind）为准，
@@ -632,19 +671,23 @@ app.post('/api/publications', (req, res) => {
       divisions: cfg.divisions.map(divisionView),
       assignments: assignmentsView(cfg),
     });
+    // 冻结发布当时的罚时裁决（含已撤销留痕与逐条审计）；后续登记/撤销不改历史版
+    const { rulings: penaltyRulings, audits: penaltyAudits } = listRulings(db);
+    const penaltiesJson = JSON.stringify({ rulings: penaltyRulings, audits: penaltyAudits });
     const readingsJson = JSON.stringify(readings);
     const resultsJson = JSON.stringify(results);
     db.prepare(
-      `INSERT INTO publication (version, event_revision, note, config_json, stoppages_json, divisions_json, readings_json, results_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(version, cfg.revision, note, configJson, stoppagesJson, divisionsJson, readingsJson, resultsJson);
+      `INSERT INTO publication (version, event_revision, note, config_json, stoppages_json, divisions_json, penalties_json, readings_json, results_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(version, cfg.revision, note, configJson, stoppagesJson, divisionsJson, penaltiesJson, readingsJson, resultsJson);
     const insR = db.prepare(
-      `INSERT INTO published_result (publication_version, bib, name, status, elapsed, net_elapsed, fail_at, detail, rank_no, division_code, group_rank)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO published_result (publication_version, bib, name, status, elapsed, net_elapsed, penalty_secs, official_elapsed, fail_at, detail, rank_no, division_code, group_rank)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     for (const r of results)
-      insR.run(version, r.bib, r.name, r.status, r.elapsed, r.netElapsed ?? null, r.failAt ?? null, r.detail,
-        r.rank ?? null, r.divisionCode ?? null, r.groupRank ?? null);
+      insR.run(version, r.bib, r.name, r.status, r.elapsed, r.netElapsed ?? null,
+        r.penaltySecs ?? 0, r.officialElapsed ?? null,
+        r.failAt ?? null, r.detail, r.rank ?? null, r.divisionCode ?? null, r.groupRank ?? null);
     // 发布本身冻结快照；继续推进修订号，使旧页面的导入/发布请求走过期核对
     const rev = bumpRevision(db);
     return { version, rev };
@@ -665,6 +708,16 @@ app.get('/api/publications/:version', (req, res) => {
     .prepare('SELECT * FROM publication WHERE version = ?')
     .get(v);
   if (!row) return res.status(404).json({ error: '发布版不存在' });
+  // 旧版 results_json 无正式耗时/罚时字段：旧库无裁决按零罚时兼容（正式耗时即净耗时）
+  const results = JSON.parse(row.results_json).map((r) => ({
+    ...r,
+    penaltySecs: r.penaltySecs ?? 0,
+    penalties: r.penalties ?? [],
+    officialElapsed:
+      r.officialElapsed != null ? r.officialElapsed
+        : r.netElapsed != null ? r.netElapsed
+        : null,
+  }));
   res.json({
     version: row.version,
     eventRevision: row.event_revision,
@@ -674,8 +727,10 @@ app.get('/api/publications/:version', (req, res) => {
     stoppages: JSON.parse(row.stoppages_json || '[]'),
     // 冻结的组别赛道与归属（旧版发布时无组别，迁移回填为空集合）
     divisions: JSON.parse(row.divisions_json || '{"divisions":[],"assignments":[]}'),
+    // 冻结的罚时裁决与审计（旧版发布时无裁决，迁移/回填为空集合，按零罚时兼容）
+    penalties: JSON.parse(row.penalties_json || '{"rulings":[],"audits":[]}'),
     readings: JSON.parse(row.readings_json),
-    results: JSON.parse(row.results_json),
+    results,
   });
 });
 

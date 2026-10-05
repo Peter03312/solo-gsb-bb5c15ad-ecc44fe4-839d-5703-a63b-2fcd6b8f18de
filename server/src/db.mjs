@@ -23,6 +23,7 @@ export function initDb(db = getDb()) {
   migratePunchOriginals(db);
   migrateStopwatch(db);
   migrateDivisions(db);
+  migratePenalties(db);
 }
 
 /**
@@ -93,6 +94,31 @@ function migratePunchOriginals(db) {
                ORDER BY a.id LIMIT 1), seconds),
             orig_kind = kind`
   ).run();
+}
+
+/**
+ * 旧库迁移：罚时裁决功能新增表/列。
+ * - penalty_ruling / penalty_audit 为新表，CREATE TABLE IF NOT EXISTS 已自动建立
+ *   （旧库初始无任何裁决，按零罚时兼容）；
+ * - publication 增加 penalties_json（旧发布版冻结当时无裁决，回填空裁决/空审计）；
+ * - published_result 增加 penalty_secs 与 official_elapsed：旧版发布时无罚时，
+ *   有效罚时合计回填 0，正式耗时回填 net_elapsed（未完赛者三列均为 NULL/0）。
+ * 幂等：列已存在时跳过。
+ */
+function migratePenalties(db) {
+  const pubCols = db.prepare('PRAGMA table_info(publication)').all().map((c) => c.name);
+  if (!pubCols.includes('penalties_json'))
+    db.exec(`ALTER TABLE publication ADD COLUMN penalties_json TEXT NOT NULL DEFAULT '{"rulings":[],"audits":[]}'`);
+  const resCols = db.prepare('PRAGMA table_info(published_result)').all().map((c) => c.name);
+  if (!resCols.includes('penalty_secs'))
+    db.exec('ALTER TABLE published_result ADD COLUMN penalty_secs INTEGER NOT NULL DEFAULT 0');
+  if (!resCols.includes('official_elapsed')) {
+    db.exec('ALTER TABLE published_result ADD COLUMN official_elapsed INTEGER');
+    // 旧发布版发布时尚无罚时：正式耗时 = 净耗时（未完赛者为 NULL）
+    db.prepare(
+      'UPDATE published_result SET official_elapsed = net_elapsed WHERE official_elapsed IS NULL AND net_elapsed IS NOT NULL'
+    ).run();
+  }
 }
 
 /** 推进赛事修订号并返回新值（任何配置/读数/更正变化都使旧修订过期） */

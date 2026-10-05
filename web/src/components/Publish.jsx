@@ -37,8 +37,9 @@ export default function Publish({ event, onChanged, onError }) {
     <div className="panel">
       <h2>发布与冻结</h2>
       <p className="muted small">
-        发布时将关卡配置、组别赛道与选手归属、停表区间、全部有效读数（作废读数除外）及当次成绩
-        （含全场名次与组内名次）一并快照冻结；发布后裁判仍可更正当前数据并发布新版，但<b>历史版本永不改变</b>。
+        发布时将关卡配置、组别赛道与选手归属、停表区间、罚时裁决、全部有效读数（作废读数除外）及当次成绩
+        （含正式耗时、全场名次与组内名次）一并快照冻结；发布后裁判仍可更正当前数据并发布新版，但<b>历史版本永不改变</b>
+        （冻结后撤销裁决不改历史的 officialElapsed 与名次）。
       </p>
       <div className="inline-fields">
         <label className="grow">版本备注（可选）<input value={note} onChange={e => setNote(e.target.value)} placeholder="如：申诉处理后第二版" /></label>
@@ -82,6 +83,26 @@ export default function Publish({ event, onChanged, onError }) {
                     ? '无'
                     : viewing.stoppages.map(s => `${s.startSecs}s–${s.endSecs}s`).join('，')}
                 </li>
+                <li>
+                  冻结罚时裁决：
+                  {(() => {
+                    const active = (viewing.penalties?.rulings || []).filter(r => r.status === 'active');
+                    const revoked = (viewing.penalties?.rulings || []).filter(r => r.status === 'revoked');
+                    return active.length === 0 && revoked.length === 0
+                      ? '无'
+                      : `${active.length} 条有效${revoked.length ? `、${revoked.length} 条已撤销（留痕）` : ''}`;
+                  })()}
+                </li>
+                {(viewing.penalties?.rulings || []).length > 0 && (
+                  <div className="readings">
+                    {viewing.penalties.rulings.map(r => (
+                      <span key={r.rulingNo} className="chip" title={`${r.reason}${r.revokeReason ? `\n撤销：${r.revokeReason}` : ''}`}
+                        style={r.status === 'revoked' ? { textDecoration: 'line-through', opacity: 0.6 } : undefined}>
+                        {r.bib} {r.rulingNo}<small>{r.status === 'active' ? `+${r.seconds}s` : '已撤销'}</small>
+                      </span>
+                    ))}
+                  </div>
+                )}
               </ul>
               <h4>冻结组别赛道与归属</h4>
               {(viewing.divisions?.divisions || []).length === 0 ? (
@@ -114,9 +135,9 @@ export default function Publish({ event, onChanged, onError }) {
               </div>
             </div>
             <div>
-              <h4>冻结成绩（全场名次按冻结停表区间的净耗时；组内名次为同组完赛者排名）</h4>
+              <h4>冻结成绩（名次按冻结的正式耗时 officialElapsed = 净耗时 + 有效罚时；组内名次为同组完赛者排名）</h4>
               <table className="grid compact">
-                <thead><tr><th>名次</th><th>组内名次</th><th>号码</th><th>组别</th><th>状态</th><th>原始耗时</th><th>净耗时</th><th>说明</th></tr></thead>
+                <thead><tr><th>名次</th><th>组内名次</th><th>号码</th><th>组别</th><th>状态</th><th>原始耗时</th><th>净耗时</th><th>罚时</th><th>正式耗时</th><th>说明</th></tr></thead>
                 <tbody>
                   {viewing.results.map(r => (
                     <tr key={r.bib}>
@@ -126,7 +147,9 @@ export default function Publish({ event, onChanged, onError }) {
                       <td>{r.divisionCode || <span className="muted small">未分组</span>}</td>
                       <td>{STATUS_LABEL[r.status] || r.status}</td>
                       <td>{r.elapsed != null ? `${fmtTime(r.elapsed)}（${r.elapsed}s）` : '—'}</td>
-                      <td>{r.netElapsed != null ? <b>{`${fmtTime(r.netElapsed)}（${r.netElapsed}s）`}</b> : '—'}</td>
+                      <td>{r.netElapsed != null ? `${fmtTime(r.netElapsed)}（${r.netElapsed}s）` : '—'}</td>
+                      <td>{r.penaltySecs ? `+${r.penaltySecs}s` : '0s'}</td>
+                      <td>{r.officialElapsed != null ? <b>{`${fmtTime(r.officialElapsed)}（${r.officialElapsed}s）`}</b> : '—'}</td>
                       <td className="small muted">{r.detail}{r.failAt ? `（${r.failAt}）` : ''}</td>
                     </tr>
                   ))}

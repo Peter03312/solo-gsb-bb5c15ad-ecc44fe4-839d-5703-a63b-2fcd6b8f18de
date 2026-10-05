@@ -48,6 +48,21 @@ export function seedDemo(db) {
     const insAsg = db.prepare('INSERT INTO runner_division (bib, division_id) VALUES (?, ?)');
     insAsg.run('201', meId); insAsg.run('202', weId); insAsg.run('203', meId);
 
+    // 示范罚时裁决：002（终点超时）有一条有效 +60s 裁决（未完赛时不计正式耗时，
+    // 若其后续经申诉完赛则计入）；003（组未完成）的 +30s 裁决已撤销（撤销后号码不可复用）。
+    const insRuling = db.prepare(
+      'INSERT INTO penalty_ruling (ruling_no, bib, seconds, reason, status, revoke_reason, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    );
+    insRuling.run('P-DEMO-01', '002', 60, '漏打强制点，依据终点裁判记录加罚 60 秒', 'active', null, null);
+    insRuling.run('P-DEMO-02', '003', 30, '初判晚出发 30 秒（待复核）',
+      'revoked', '复核后认定出发正常，撤销该罚时', null);
+    const insPAudit = db.prepare(
+      'INSERT INTO penalty_audit (ruling_no, action, bib, seconds, reason, revoke_reason) VALUES (?, ?, ?, ?, ?, ?)'
+    );
+    insPAudit.run('P-DEMO-01', 'register', '002', 60, '漏打强制点，依据终点裁判记录加罚 60 秒', null);
+    insPAudit.run('P-DEMO-02', 'register', '003', 30, '初判晚出发 30 秒（待复核）', null);
+    insPAudit.run('P-DEMO-02', 'revoke', '003', 30, '初判晚出发 30 秒（待复核）', '复核后认定出发正常，撤销该罚时');
+
     // record_no 全局唯一；kind: start | enroute | finish
     // 首次入库时现值即原始读数，orig_* 同步落库
     const insP = db.prepare(

@@ -38,6 +38,9 @@ export const api = {
   divisions: () => request('/api/divisions'),
   saveDivisions: payload =>
     request('/api/divisions', { method: 'POST', body: JSON.stringify(payload) }),
+  penalties: () => request('/api/penalties'),
+  submitPenalties: payload =>
+    request('/api/penalties', { method: 'POST', body: JSON.stringify(payload) }),
   appealPreview: payload =>
     request('/api/appeals/preview', { method: 'POST', body: JSON.stringify(payload) }),
   appealConfirm: payload =>

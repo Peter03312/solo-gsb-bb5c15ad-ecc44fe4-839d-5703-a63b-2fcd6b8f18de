@@ -70,7 +70,11 @@ export default function Results() {
             </span>
           ))
         )}
-        ；未分组者沿用默认赛道。<b>名次</b>为全场净耗时名次，<b>组内名次</b>只在同组完赛者中计算（允许并列），未完赛者两种名次均为空。
+        ；未分组者沿用默认赛道。<b>名次</b>为全场<b>正式耗时</b>名次，<b>组内名次</b>只在同组完赛者中计算（允许并列），未完赛者两种名次均为空。
+      </p>
+      <p className="muted small">
+        罚时裁决：完赛者 <b>officialElapsed = netElapsed + 有效罚时合计</b>，排名/并列按正式耗时；
+        未完赛者罚时仅列出、不产生正式耗时与名次；<b>elapsed / netElapsed 含义不变</b>。
       </p>
       <div className="filter">
         <label className="muted small" style={{ alignSelf: 'center' }}>按组别查看：</label>
@@ -86,7 +90,7 @@ export default function Results() {
         <thead>
           <tr>
             <th>名次</th><th>组内名次</th><th>号码布</th><th>姓名</th><th>组别</th><th>状态</th>
-            <th>原始耗时</th><th>停表扣减</th><th>净耗时</th>
+            <th>原始耗时</th><th>停表扣减</th><th>净耗时</th><th>有效罚时</th><th>正式耗时</th>
             <th>首个未完成 / 说明</th><th className="chain-col">最早有效链</th>
           </tr>
         </thead>
@@ -109,8 +113,25 @@ export default function Results() {
                 <td>{r.stoppedSecs ? `${r.stoppedSecs}s` : (r.status === 'ok' ? '0s' : '—')}</td>
                 <td>
                   {r.netElapsed != null
-                    ? <b>{`${fmtTime(r.netElapsed)}（${r.netElapsed}s）`}</b>
+                    ? `${fmtTime(r.netElapsed)}（${r.netElapsed}s）`
                     : <span className="muted">未完赛无净耗时</span>}
+                </td>
+                <td>
+                  {r.penaltySecs ? (
+                    <span className="chain">
+                      <span className="badge warn" title={(r.penalties || []).map(p => `${p.rulingNo}：${p.reason}`).join('\n')}>
+                        +{r.penaltySecs}s
+                      </span>
+                      {(r.penalties || []).map(p => (
+                        <span className="chip" key={p.rulingNo} title={`${p.reason}`}>{p.rulingNo}<small>+{p.seconds}s</small></span>
+                      ))}
+                    </span>
+                  ) : '0s'}
+                </td>
+                <td>
+                  {r.officialElapsed != null
+                    ? <b>{`${fmtTime(r.officialElapsed)}（${r.officialElapsed}s）`}</b>
+                    : <span className="muted">未完赛无正式耗时</span>}
                 </td>
                 <td>{r.failAt ? <><b>{r.failAt}</b>：{r.detail}</> : r.detail || '—'}</td>
                 <td className="chain">
@@ -127,15 +148,16 @@ export default function Results() {
             );
           })}
           {rows.length === 0 && (
-            <tr><td colSpan="11" className="muted">该筛选下暂无选手。</td></tr>
+            <tr><td colSpan="13" className="muted">该筛选下暂无选手。</td></tr>
           )}
         </tbody>
       </table>
       <p className="muted small">
         规则：打卡时间相对发枪秒数须严格递增，按所属赛道关卡组顺序每组在可替代点位中选最早一条；
-        逆序及多余打卡不作完成依据。净耗时 = 原始耗时 − 停表区间并集与本人出发→终点区间的交长，
-        同净耗时并列同名次；原始耗时（elapsed）语义不变。组内名次仅在同一赛道（同组别；未分组者同属默认赛道）
-        的完赛者之间按净耗时计算，允许并列。
+        逆序及多余打卡不作完成依据。净耗时 = 原始耗时 − 停表区间并集与本人出发→终点区间的交长；
+        <b>正式耗时 = 净耗时 + 有效罚时合计</b>，同正式耗时并列同名次；原始耗时（elapsed）语义不变。
+        组内名次仅在同一赛道（同组别；未分组者同属默认赛道）的完赛者之间按正式耗时计算，允许并列；
+        未完赛者罚时仍列出但两种名次均为空。
       </p>
     </div>
   );
