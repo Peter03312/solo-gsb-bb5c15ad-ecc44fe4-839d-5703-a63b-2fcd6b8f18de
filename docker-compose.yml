@@ -1,0 +1,24 @@
+services:
+  app:
+    build: .
+    image: orienteering-review:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - orienteering-data:/data
+    environment:
+      # SQLite 数据库文件位置（持久化到命名卷）
+      DB_FILE: /data/orienteering.db
+      # 服务端口（容器内）
+      PORT: "3000"
+      # 首次启动写入演示赛事与打卡数据；置 0 则空白启动
+      SEED: "1"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/event"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  orienteering-data:
