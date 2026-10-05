@@ -94,6 +94,32 @@ CREATE TABLE IF NOT EXISTS punch (
 );
 CREATE INDEX IF NOT EXISTS idx_punch_bib ON punch(bib);
 
+-- 裁判罚时裁决（批量登记/撤销，裁决号全局唯一且撤销后不可复用）。
+-- status: active（有效，计入 officialElapsed）| revoked（已撤销，仅留痕，不再计入）
+-- 罚时为正整数秒；登记原因/撤销原因均永久留痕。
+CREATE TABLE IF NOT EXISTS penalty (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  decision_no   TEXT NOT NULL UNIQUE,
+  bib           TEXT NOT NULL REFERENCES runner(bib),
+  seconds       INTEGER NOT NULL CHECK (seconds > 0),
+  reason        TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
+  revoke_reason TEXT,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  revoked_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_penalty_bib ON penalty(bib);
+
+-- 罚时裁决操作审计：登记 / 撤销逐条留痕（撤销为状态翻转，原行保留）
+CREATE TABLE IF NOT EXISTS penalty_audit (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  penalty_id  INTEGER NOT NULL REFERENCES penalty(id),
+  action      TEXT NOT NULL CHECK (action IN ('register', 'revoke')),
+  seconds     INTEGER,
+  reason      TEXT NOT NULL,
+  at          TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- 裁判操作审计：作废 / 更正均保留原值与原因（更正只改 point/seconds）
 CREATE TABLE IF NOT EXISTS punch_audit (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,13 +142,15 @@ CREATE TABLE IF NOT EXISTS publication (
   config_json     TEXT NOT NULL,
   stoppages_json  TEXT NOT NULL DEFAULT '[]',
   divisions_json  TEXT NOT NULL DEFAULT '{"divisions":[],"assignments":[]}',
+  penalties_json  TEXT NOT NULL DEFAULT '[]',
   readings_json   TEXT NOT NULL,
   results_json    TEXT NOT NULL
 );
 
 -- 发布版成绩（便于排名查询），历史版永不被后续更正修改
 -- elapsed=原始耗时；net_elapsed=发布当时按冻结停表区间算出的净耗时（未完赛为 NULL）
--- rank_no=全场净耗时名次；group_rank=同组完赛者中的组内名次（允许并列，未完赛为 NULL）
+-- penalty_secs=发布当时该号码布有效罚时合计；official_elapsed=net_elapsed+罚时（正式耗时，未完赛为 NULL）
+-- rank_no=全场正式耗时名次；group_rank=同组完赛者中的组内名次（允许并列，未完赛为 NULL）
 CREATE TABLE IF NOT EXISTS published_result (
   publication_version INTEGER NOT NULL REFERENCES publication(version),
   bib         TEXT NOT NULL,
@@ -130,6 +158,8 @@ CREATE TABLE IF NOT EXISTS published_result (
   status      TEXT NOT NULL,
   elapsed     INTEGER,
   net_elapsed INTEGER,
+  penalty_secs    INTEGER NOT NULL DEFAULT 0,
+  official_elapsed INTEGER,
   fail_at     TEXT,
   detail      TEXT,
   rank_no     INTEGER,

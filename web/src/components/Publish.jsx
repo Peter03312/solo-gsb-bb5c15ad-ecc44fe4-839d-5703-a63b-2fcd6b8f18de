@@ -37,8 +37,9 @@ export default function Publish({ event, onChanged, onError }) {
     <div className="panel">
       <h2>发布与冻结</h2>
       <p className="muted small">
-        发布时将关卡配置、组别赛道与选手归属、停表区间、全部有效读数（作废读数除外）及当次成绩
-        （含全场名次与组内名次）一并快照冻结；发布后裁判仍可更正当前数据并发布新版，但<b>历史版本永不改变</b>。
+        发布时将关卡配置、组别赛道与选手归属、停表区间、<b>全部罚时裁决</b>、全部有效读数（作废读数除外）及当次成绩
+        （含正式耗时、全场名次与组内名次）一并快照冻结；发布后裁判仍可更正当前数据并发布新版，但<b>历史版本永不改变</b>
+        ——后续登记/撤销罚时不会改变历史版冻结的裁决、officialElapsed 与名次。
       </p>
       <div className="inline-fields">
         <label className="grow">版本备注（可选）<input value={note} onChange={e => setNote(e.target.value)} placeholder="如：申诉处理后第二版" /></label>
@@ -112,11 +113,28 @@ export default function Publish({ event, onChanged, onError }) {
                   <span className="chip" key={r.record_no}>{r.bib} {r.point}<small>{r.seconds}s</small></span>
                 ))}
               </div>
+              <h4>冻结罚时裁决（{(viewing.penalties || []).length} 条）</h4>
+              {(viewing.penalties || []).length === 0 ? (
+                <p className="muted small">无裁决：旧版发布时零罚时，正式耗时即净耗时。</p>
+              ) : (
+                <ul className="muted small">
+                  {viewing.penalties.map(p => (
+                    <li key={p.decisionNo} className={p.status === 'revoked' ? 'row-void' : ''}>
+                      {p.decisionNo} · {p.bib} · +{p.seconds}s ·
+                      {p.status === 'active'
+                        ? <span className="badge ok">有效</span>
+                        : <span className="badge bad">已撤销</span>}
+                      {p.reason}
+                      {p.status === 'revoked' ? `（撤销：${p.revokeReason}）` : ''}
+                    </li>
+                  ))}
+                </ul>
+              )}
             </div>
             <div>
-              <h4>冻结成绩（全场名次按冻结停表区间的净耗时；组内名次为同组完赛者排名）</h4>
+              <h4>冻结成绩（全场名次按冻结罚时的正式耗时 officialElapsed；组内名次为同组完赛者排名）</h4>
               <table className="grid compact">
-                <thead><tr><th>名次</th><th>组内名次</th><th>号码</th><th>组别</th><th>状态</th><th>原始耗时</th><th>净耗时</th><th>说明</th></tr></thead>
+                <thead><tr><th>名次</th><th>组内名次</th><th>号码</th><th>组别</th><th>状态</th><th>原始耗时</th><th>净耗时</th><th>罚时</th><th>正式耗时</th><th>说明</th></tr></thead>
                 <tbody>
                   {viewing.results.map(r => (
                     <tr key={r.bib}>
@@ -126,7 +144,9 @@ export default function Publish({ event, onChanged, onError }) {
                       <td>{r.divisionCode || <span className="muted small">未分组</span>}</td>
                       <td>{STATUS_LABEL[r.status] || r.status}</td>
                       <td>{r.elapsed != null ? `${fmtTime(r.elapsed)}（${r.elapsed}s）` : '—'}</td>
-                      <td>{r.netElapsed != null ? <b>{`${fmtTime(r.netElapsed)}（${r.netElapsed}s）`}</b> : '—'}</td>
+                      <td>{r.netElapsed != null ? `${fmtTime(r.netElapsed)}（${r.netElapsed}s）` : '—'}</td>
+                      <td>{r.officialElapsed != null ? `+${r.penaltySecs ?? 0}s` : '—'}</td>
+                      <td>{r.officialElapsed != null ? <b>{`${fmtTime(r.officialElapsed)}（${r.officialElapsed}s）`}</b> : '—'}</td>
                       <td className="small muted">{r.detail}{r.failAt ? `（${r.failAt}）` : ''}</td>
                     </tr>
                   ))}

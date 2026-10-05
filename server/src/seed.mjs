@@ -88,6 +88,19 @@ export function seedDemo(db) {
     ];
     const tx = db.transaction(() => {
       for (const r of rows) insP.run(r[0], r[1], r[2], r[3], r[4], r[1], r[2], r[3], r[4]);
+
+      // 示范罚时裁决：J001 已撤销（不计入正式耗时、编号不可复用），保留登记/撤销两条审计。
+      // 与读数在同一初始事务落库，修订仍为 #1；有效罚时可由裁判在「罚时裁决」页批量登记。
+      const insPen = db.prepare(
+        "INSERT INTO penalty (decision_no, bib, seconds, reason, status, revoke_reason, revoked_at) VALUES (?, ?, ?, ?, 'revoked', ?, datetime('now'))"
+      );
+      const insPenAudit = db.prepare(
+        'INSERT INTO penalty_audit (penalty_id, action, seconds, reason) VALUES (?, ?, ?, ?)'
+      );
+      const pj1 = insPen.run('J001', '001', 60, '初判：疑似漏点（后经监控复核）', '复核后申诉成立，撤销该罚时').lastInsertRowid;
+      insPenAudit.run(pj1, 'register', 60, '初判：疑似漏点（后经监控复核）');
+      insPenAudit.run(pj1, 'revoke', null, '复核后申诉成立，撤销该罚时');
+
       // 关卡初始为修订 #1，演示读数导入后推进
       bumpRevision(db);
       db.prepare('INSERT INTO meta (k, v) VALUES (?, ?)').run('seeded', '1');

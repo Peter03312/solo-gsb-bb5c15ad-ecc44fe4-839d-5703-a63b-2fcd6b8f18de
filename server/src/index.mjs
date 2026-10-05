@@ -8,6 +8,7 @@ import {
   validateOperations, canonicalOps, signPreview, verifyPreview,
   previewCase, commitCase,
 } from './appeals.mjs';
+import { normalizePenaltyEntries, applyPenaltyBatch, penaltyView } from './penalties.mjs';
 import { seedDemo } from './seed.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -475,6 +476,8 @@ app.get('/api/results', (req, res) => {
     divisions: cfg.divisions.map(divisionView),
     assignments: assignmentsView(cfg),
     stoppages: cfg.stoppages.map((s) => ({ startSecs: s.start, endSecs: s.end })),
+    // 全部罚时裁决（含已撤销留痕）；每人 penaltySecs/officialElapsed 已并入 results
+    penalties: cfg.penalties.map(penaltyView),
     results,
   });
 });
@@ -599,6 +602,61 @@ app.post('/api/appeals/confirm', (req, res) => {
   });
 });
 
+// ---------- 罚时裁决：批量登记 / 撤销（整批原子，幂等重传/重撤） ----------
+/**
+ * GET /api/penalties?bib=&status=
+ * 返回全部裁决（含已撤销留痕）与逐条审计；可按号码布、状态（active|revoked）筛选。
+ */
+app.get('/api/penalties', (req, res) => {
+  const cfg = loadConfig(db);
+  if (!cfg) return res.json({ configured: false, revision: 0, penalties: [], audits: [] });
+  const { bib, status } = req.query;
+  let rows = cfg.penalties;
+  if (bib) rows = rows.filter((p) => p.bib === bib);
+  if (status === 'active' || status === 'revoked') rows = rows.filter((p) => p.status === status);
+
+  const ids = new Set(rows.map((p) => p.id));
+  let auditRows = db.prepare('SELECT * FROM penalty_audit ORDER BY at, id').all();
+  if (rows !== cfg.penalties) auditRows = auditRows.filter((a) => ids.has(a.penalty_id));
+  const audits = auditRows.map((a) => ({
+    id: a.id, penaltyId: a.penalty_id, action: a.action,
+    seconds: a.seconds, reason: a.reason, at: a.at,
+  }));
+  res.json({ configured: true, revision: cfg.revision, penalties: rows.map(penaltyView), audits });
+});
+
+/**
+ * POST /api/penalties/batch
+ * body: { expectedRevision, entries: [
+ *   { action:'register', decisionNo, bib, seconds(正整数), reason },
+ *   { action:'revoke',   decisionNo, reason } ] }
+ * 批内重复且内容冲突、未知选手/裁决、已撤销编号复用、内容冲突、非法秒数 => 400 整批拒绝；
+ * 修订过期 => 409 + currentRevision；同号同内容重传 / 已撤销同原因重撤为幂等（不推进修订）；
+ * 实际变化在单事务内逐条落库与审计，修订号只推进一次。
+ */
+app.post('/api/penalties/batch', (req, res) => {
+  if (!checkRevision(req, res)) return;
+  if (!loadConfig(db)) return badRequest(res, '赛事尚未配置，请先设置关卡组');
+  const parsed = normalizePenaltyEntries(req.body?.entries);
+  if (parsed.error) return badRequest(res, parsed.error);
+  let out;
+  try {
+    out = applyPenaltyBatch(db, parsed.entries, bumpRevision);
+  } catch (err) {
+    return badRequest(res, err.message);
+  }
+  const revision = out.revision != null ? out.revision : currentRevision(db);
+  res.json({
+    ok: true,
+    revision,
+    changed: out.revision != null,
+    registered: out.registered,
+    revoked: out.revoked,
+    idempotent: out.idempotent,
+    decisions: out.decisions,
+  });
+});
+
 // ---------- 发布（冻结） ----------
 app.post('/api/publications', (req, res) => {
   if (!checkRevision(req, res)) return;
@@ -632,18 +690,22 @@ app.post('/api/publications', (req, res) => {
       divisions: cfg.divisions.map(divisionView),
       assignments: assignmentsView(cfg),
     });
+    // 冻结发布当时的全部罚时裁决（含已撤销留痕）；发布后再登记/撤销不改历史版
+    const penalties = cfg.penalties.map(penaltyView);
+    const penaltiesJson = JSON.stringify(penalties);
     const readingsJson = JSON.stringify(readings);
     const resultsJson = JSON.stringify(results);
     db.prepare(
-      `INSERT INTO publication (version, event_revision, note, config_json, stoppages_json, divisions_json, readings_json, results_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(version, cfg.revision, note, configJson, stoppagesJson, divisionsJson, readingsJson, resultsJson);
+      `INSERT INTO publication (version, event_revision, note, config_json, stoppages_json, divisions_json, penalties_json, readings_json, results_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(version, cfg.revision, note, configJson, stoppagesJson, divisionsJson, penaltiesJson, readingsJson, resultsJson);
     const insR = db.prepare(
-      `INSERT INTO published_result (publication_version, bib, name, status, elapsed, net_elapsed, fail_at, detail, rank_no, division_code, group_rank)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO published_result (publication_version, bib, name, status, elapsed, net_elapsed, penalty_secs, official_elapsed, fail_at, detail, rank_no, division_code, group_rank)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     for (const r of results)
-      insR.run(version, r.bib, r.name, r.status, r.elapsed, r.netElapsed ?? null, r.failAt ?? null, r.detail,
+      insR.run(version, r.bib, r.name, r.status, r.elapsed, r.netElapsed ?? null,
+        r.penaltySecs ?? 0, r.officialElapsed ?? null, r.failAt ?? null, r.detail,
         r.rank ?? null, r.divisionCode ?? null, r.groupRank ?? null);
     // 发布本身冻结快照；继续推进修订号，使旧页面的导入/发布请求走过期核对
     const rev = bumpRevision(db);
@@ -674,6 +736,8 @@ app.get('/api/publications/:version', (req, res) => {
     stoppages: JSON.parse(row.stoppages_json || '[]'),
     // 冻结的组别赛道与归属（旧版发布时无组别，迁移回填为空集合）
     divisions: JSON.parse(row.divisions_json || '{"divisions":[],"assignments":[]}'),
+    // 冻结的全部罚时裁决（含已撤销留痕；旧版发布时无裁决，迁移回填为空数组）
+    penalties: JSON.parse(row.penalties_json || '[]'),
     readings: JSON.parse(row.readings_json),
     results: JSON.parse(row.results_json),
   });

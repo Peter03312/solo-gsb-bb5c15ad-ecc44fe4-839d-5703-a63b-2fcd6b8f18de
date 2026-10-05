@@ -38,7 +38,9 @@ function RankCell({ r }) {
       {r.elapsed != null ? (
         <>
           <div className="small">原始 {r.elapsed}s{r.stoppedSecs ? `（停表 −${r.stoppedSecs}s）` : ''}</div>
-          <div className="small"><b>净耗时 {r.netElapsed ?? r.elapsed}s（{fmtTime(r.netElapsed ?? r.elapsed)}）</b></div>
+          <div className="small">净耗时 {r.netElapsed ?? r.elapsed}s（{fmtTime(r.netElapsed ?? r.elapsed)}）</div>
+          <div className="small">罚时 +{r.penaltySecs ?? 0}s</div>
+          <div className="small"><b>正式 {r.officialElapsed ?? (r.netElapsed ?? r.elapsed)}s（{fmtTime(r.officialElapsed ?? (r.netElapsed ?? r.elapsed))}）</b></div>
         </>
       ) : <div className="small">—</div>}
     </div>
@@ -302,7 +304,7 @@ export default function Appeal({ event, onChanged, onError }) {
             {confirmResult.auditCount} 条变更及逐条审计已一次性写入（事务原子提交，无部分生效）；历史发布版保持冻结。
           </p>
           <table className="grid compact">
-            <thead><tr><th>名次</th><th>组内名次</th><th>号码布</th><th>姓名</th><th>状态</th><th>原始耗时</th><th>净耗时</th><th>说明</th></tr></thead>
+            <thead><tr><th>名次</th><th>组内名次</th><th>号码布</th><th>姓名</th><th>状态</th><th>原始耗时</th><th>净耗时</th><th>罚时</th><th>正式耗时</th><th>说明</th></tr></thead>
             <tbody>
               {confirmResult.results.map(r => (
                 <tr key={r.bib} className={r.status === 'ok' ? '' : 'row-dnf'}>
@@ -312,7 +314,9 @@ export default function Appeal({ event, onChanged, onError }) {
                   <td>{r.name || '—'}</td>
                   <td><span className={`badge ${STATUS_CLS[r.status] || 'bad'}`}>{STATUS_LABEL[r.status] || r.status}</span></td>
                   <td>{r.elapsed != null ? `${r.elapsed}s（${fmtTime(r.elapsed)}）` : '—'}</td>
-                  <td>{r.netElapsed != null ? <b>{`${r.netElapsed}s（${fmtTime(r.netElapsed)}）`}</b> : '—'}</td>
+                  <td>{r.netElapsed != null ? `${r.netElapsed}s（${fmtTime(r.netElapsed)}）` : '—'}</td>
+                  <td>{r.elapsed != null ? `+${r.penaltySecs ?? 0}s` : '—'}</td>
+                  <td>{r.officialElapsed != null ? <b>{`${r.officialElapsed}s（${fmtTime(r.officialElapsed)}）`}</b> : '—'}</td>
                   <td className="small muted">{r.failAt ? `${r.failAt}：${r.detail}` : r.detail || '—'}</td>
                 </tr>
               ))}

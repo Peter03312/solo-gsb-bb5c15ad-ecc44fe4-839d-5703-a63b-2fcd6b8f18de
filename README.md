@@ -18,6 +18,15 @@
 **未知组别、重复归属、空替代点位**整次拒绝。发布版冻结组别赛道、归属与两种名次，后续变更不改历史；
 旧库与原有未分组调用继续可用。
 
+**罚时裁决（本轮新增）**：裁判可**批量登记或撤销**选手的罚时裁决——登记含**唯一裁决号、已有号码布、
+正整数秒数、原因**，撤销含**裁决号与原因**。**批内重复、未知选手或裁决、内容冲突及非法秒数整批拒绝，
+不留部分审计**；同号同内容的有效裁决重传、已撤销裁决同原因重撤均**幂等**，**撤销后裁决号不可复用**。
+请求须带 `expectedRevision`，过期返回当前修订号；实际变更**原子留痕且只推进一次修订号**。
+完赛者的 **`officialElapsed = netElapsed + 有效罚时合计`**，`rank`/`groupRank` 改为**按正式耗时**计算并
+允许并列；未完赛者名次仍为空，原有 `elapsed`/`netElapsed` 含义不变。**整案申诉**预演与确认展示同一裁决下
+的前后成绩及名次，**裁决变更使旧预演令牌失效**。**发布版冻结裁决、`officialElapsed` 和名次，后续撤销不改
+历史**；旧库无裁决按零罚时兼容（正式耗时即净耗时）。
+
 技术栈：**Node.js + Express + React（Vite）+ SQLite（better-sqlite3）**。
 
 ---
@@ -98,12 +107,14 @@ npm start          # http://localhost:3000
    - 若该组设置了组截止秒数，还须不晚于该秒数。
 3. 终点打卡必须在最后一组之后、且距发枪秒数不超过**所属赛道的终点截止秒数**（`<=`，刚好在截止点有效）。
 4. **逆序打卡与多余打卡**（如途中再次经过起点、无关点位、晚于终点的打卡）不作为任何组/终点的完成依据。
-5. 完成者按**净耗时**升序排名，**同净耗时并列同名次**；`elapsed`（原始耗时 = 终点秒数 − 出发秒数）语义不变，
-   另返回 `netElapsed`（净耗时）与 `stoppedSecs`（被扣减的停表秒数），未完赛者净耗时为 `null`。
-6. 名次有两种（均按净耗时、允许并列）：
-   - `rank`：**全场**净耗时名次（所有赛道的完赛者一起排）；
+5. 完成者按**正式耗时**（`officialElapsed = netElapsed + 有效罚时合计`）升序排名，**同正式耗时并列同名次**；
+   `elapsed`（原始耗时 = 终点秒数 − 出发秒数）与 `netElapsed`（净耗时）语义均不变，另返回
+   `penaltySecs`（有效罚时合计）、`penaltyDetails`（每条有效裁决的裁决号/秒数/原因）与 `officialElapsed`，
+   无有效罚时（含旧库无裁决）时正式耗时即净耗时，未完赛者无净耗时/正式耗时。
+6. 名次有两种（均按正式耗时、允许并列）：
+   - `rank`：**全场**正式耗时名次（所有赛道的完赛者一起排）；
    - `groupRank`：只在**同组完赛者**中计算的组内名次——同组 = 归属同一组别，
-     **未分组者彼此构成默认赛道组**；**未完赛者两种名次均为空**。
+     **未分组者彼此构成默认赛道组**；**未完赛者两种名次均为空**（其罚时照常留痕，但不产生正式耗时与名次）。
 7. 无有效链时指出首个失败位置：
    - 出发缺失/不唯一/点位错误；
    - 第一个未在严格递增且截止前通过的关卡组（含组名与原因）；
@@ -119,7 +130,8 @@ npm start          # http://localhost:3000
 3. 完成选手 `netElapsed = elapsed − |停表并集 ∩ [出发秒数, 终点秒数]|`；
    出发前/终点后的停表时间不计；**关卡与终点截止、有效链仍按原始秒数判定**（停表不影响是否完赛）。
 4. **未完赛者无净耗时**（`netElapsed`/`stoppedSecs` 均为 `null`），不参与排名。
-5. 排名、并列、整案预演/确认前后对比都按净耗时同一规则；`elapsed` 字段含义不变（兼容旧调用方）。
+5. 排名、并列、整案预演/确认前后对比统一按**正式耗时**（`netElapsed + 有效罚时合计`）同一规则；
+   `elapsed`/`netElapsed` 字段含义不变（兼容旧调用方）。
 6. 停表配置是赛事单例集合，**整体替换**维护；变动须携带 `expectedRevision`，过期返回 **409 + `currentRevision`**；
    提交内容与现有并集完全相同（含交叠去重后相同）时为只读操作，**不推进修订号**。
 7. **发布冻结**当时的停表区间并集与据此算出的净耗时（`stoppages` 进入快照，`published_result.net_elapsed` 落库）；
@@ -250,6 +262,107 @@ curl -s http://localhost:3000/api/publications/3
 #      "results": [ { "bib":"201", "rank":5, "groupRank":1, "divisionCode":"ME", ... } ] }
 ```
 
+## 罚时裁决（批量登记 / 撤销）
+
+裁判可对选手批量施加或撤销罚时，规则如下：
+
+1. 一批 `entries` 可混合两类条目：
+   - **登记**：`{ action:"register", decisionNo, bib, seconds, reason }`——`decisionNo` 为全局唯一裁决号；
+     `bib` 必须是**已有号码布**（未知选手整批拒绝）；`seconds` 为**正整数**（0、负数、小数均整批拒绝）；
+     `reason` 必填留痕。
+   - **撤销**：`{ action:"revoke", decisionNo, reason }`——裁决号必须存在；撤销原因必填留痕。
+2. **整批原子**：批内同号重复且内容冲突、同号既登记又撤销、未知选手/裁决、与既有裁决内容冲突、
+   已撤销编号复用、非法秒数等任一非法 → **400 整批拒绝，不写任何裁决/审计（不留部分留痕）**。
+3. **幂等**：同号同内容的**有效**裁决重传（含批内完全重复）、已撤销裁决**同原因**重撤均幂等跳过，
+   不推进修订号、不重复审计；已撤销裁决**换原因重撤**或**重新使用该裁决号**均整批拒绝。
+4. 实际变化（非幂等条目）在**单个事务**内逐条落库并逐条写 `penalty_audit`，**修订号只推进一次**；
+   全部条目幂等时为只读操作。请求须带 `expectedRevision`，过期返回 **409 + `currentRevision`**。
+5. 完赛者 **`officialElapsed = netElapsed + 有效罚时合计`**；`rank`/`groupRank` 按**正式耗时**计算并允许并列。
+   **未完赛者名次仍为空**（罚时照常登记留痕，但不产生正式耗时）；`elapsed`/`netElapsed` 含义不变。
+6. 整案申诉的预演与确认在**当前有效裁决集合**下展示每人处理前后成绩（含 `penaltySecs`/`officialElapsed`）
+   与名次；**任何裁决登记/撤销都会推进修订号，使此前的预演令牌失效**（确认返回 409，须重新预演）。
+7. **发布冻结**当时全部裁决（含已撤销留痕，`penalties_json` 快照）、每人 `penalty_secs`/`official_elapsed`
+   与两种名次（落 `published_result`）；发布后再登记/撤销罚时，**历史版本的裁决、正式耗时与名次都不变**。
+8. 旧数据库首次启动自动迁移：新建 `penalty`/`penalty_audit` 表；为历史 `publication` 回填空裁决、
+   为历史 `published_result` 回填 `penalty_secs = 0`、`official_elapsed = net_elapsed`
+   （旧库无裁决按零罚时，正式耗时即净耗时，历史名次完全不变）。
+
+### 罚时裁决 HTTP 调用示例
+
+```bash
+# 1) 查询全部裁决（含已撤销留痕）与逐条审计；可按号码布/状态筛选
+curl -s http://localhost:3000/api/penalties
+curl -s 'http://localhost:3000/api/penalties?bib=401&status=active'
+# -> { "revision": 7,
+#      "penalties": [
+#        { "decisionNo":"PN100", "bib":"401", "seconds":100, "reason":"错过强制通过点",
+#          "status":"revoked", "revokeReason":"申诉成立：监控显示已通过",
+#          "createdAt":"...", "revokedAt":"..." } ],
+#      "audits": [ { "penaltyId":2, "action":"register", "seconds":100, "reason":"...", "at":"..." },
+#                  { "penaltyId":2, "action":"revoke",   "seconds":null, "reason":"...", "at":"..." } ] }
+
+# 2) 批量登记（混合多条；原子落库，修订只 +1）
+curl -s -X POST http://localhost:3000/api/penalties/batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expectedRevision": 7,
+    "entries": [
+      { "action":"register", "decisionNo":"PN200", "bib":"401", "seconds":100, "reason":"错过强制通过点" },
+      { "action":"register", "decisionNo":"PN201", "bib":"404", "seconds":20,  "reason":"未完赛者罚时照常留痕" }
+    ]
+  }'
+# -> { "ok":true, "revision":8, "changed":true,
+#      "registered":2, "revoked":0, "idempotent":0, "decisions":[ ...每条裁决最终状态... ] }
+
+# 3) 实时成绩：正式耗时 = 净耗时 + 有效罚时；名次按正式耗时
+curl -s http://localhost:3000/api/results
+# -> { "penalties": [ ...全部裁决（含已撤销）... ],
+#      "results": [
+#        { "bib":"401", "status":"ok", "elapsed":500, "netElapsed":500,
+#          "penaltySecs":100, "officialElapsed":600, "rank":3, "groupRank":3,
+#          "penaltyDetails":[ { "decisionNo":"PN200", "seconds":100, "reason":"错过强制通过点" } ], ... },
+#        { "bib":"404", "status":"group_dnf", "elapsed":null, "netElapsed":null,
+#          "penaltySecs":20, "officialElapsed":null, "rank":null, "groupRank":null, ... } ] }
+
+# 4) 混合批：撤销一条 + 新登记一条（原子，一次修订）
+curl -s -X POST http://localhost:3000/api/penalties/batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expectedRevision": 8,
+    "entries": [
+      { "action":"revoke",   "decisionNo":"PN200", "reason":"申诉成立：监控显示已通过" },
+      { "action":"register", "decisionNo":"PN202", "bib":"402", "seconds":30, "reason":"补给区外接受帮助" }
+    ]
+  }'
+# -> { "ok":true, "revision":9, "registered":1, "revoked":1, "idempotent":0, ... }
+
+# 5) 幂等重传 / 同原因重撤：changed=false、修订不变、不重复审计
+curl -s -X POST http://localhost:3000/api/penalties/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"expectedRevision":9,"entries":[
+        {"action":"register","decisionNo":"PN202","bib":"402","seconds":30,"reason":"补给区外接受帮助"},
+        {"action":"revoke",  "decisionNo":"PN200","reason":"申诉成立：监控显示已通过"}]}'
+# -> { "ok":true, "revision":9, "changed":false, "registered":0, "revoked":0, "idempotent":2, ... }
+
+# 6) 整批拒绝 / 修订过期（均不留部分审计）
+# 非法秒数：     400 { "error":"裁决 PN203：罚时秒数须为正整数，整批拒绝" }
+# 未知号码布：   400 { "error":"裁决 PN203：未知号码布 999（选手不存在），整批拒绝" }
+# 未知裁决：     400 { "error":"裁决号 GHOST 不存在，整批拒绝" }
+# 内容冲突：     400 { "error":"裁决号 PN202 已存在且内容冲突，整批拒绝" }
+# 编号复用：     400 { "error":"裁决号 PN200 已撤销，编号不可复用，整批拒绝" }
+# 异因重撤：     400 { "error":"裁决号 PN200 已撤销且撤销原因冲突，整批拒绝" }
+# 批内冲突：     400 { "error":"裁决 X2 在批次内重复且内容冲突，整批拒绝" }
+# 修订过期：     409 { "error":"赛事已修订，请刷新后重试", "currentRevision": 9 }
+
+# 7) 发布冻结裁决、正式耗时与名次；之后撤销不改历史
+curl -s -X POST http://localhost:3000/api/publications \
+  -H 'Content-Type: application/json' -d '{"expectedRevision":9,"note":"罚时冻结版"}'
+curl -s http://localhost:3000/api/publications/4
+# -> { "penalties": [ ...发布当时全部裁决（含已撤销留痕）... ],
+#      "results": [ { "bib":"402", "netElapsed":500, "penaltySecs":30,
+#                     "officialElapsed":530, "rank":2, "groupRank":2, ... } ] }
+```
+
 ## 裁判操作（争议复核）
 
 - **作废**打卡：填写原因，读数标记 voided 并不再参与核算；
@@ -262,14 +375,15 @@ curl -s http://localhost:3000/api/publications/3
 
 1. 裁判为每条现有打卡逐条选择**作废**（仅填原因）或**更正**（原因 + 新点位 + **非负整数秒数**）；
    **已作废打卡不得再处理，同一打卡在同一整案中不得重复指定**。
-2. 先调用**预演**：系统基于**当前赛事修订号**在内存中演练整案（**完全只读**——不改打卡、审计、修订号，
-   也不碰历史发布版），返回：
-   - 处理前/后每一名**受影响选手**的成绩、名次、状态、失败原因（失败组/超时秒数）与**有效链差异**
-     （移出/纳入哪些记录）；
+2. 先调用**预演**：系统基于**当前赛事修订号**（含当前有效罚时裁决集合）在内存中演练整案（**完全只读**——
+   不改打卡、裁决、审计、修订号，也不碰历史发布版），返回：
+   - 处理前/后每一名**受影响选手**的成绩（含净耗时、**有效罚时**与**正式耗时 officialElapsed**）、
+     名次（按正式耗时）、状态、失败原因（失败组/超时秒数）与**有效链差异**（移出/纳入哪些记录）；
    - 受影响名单**包含仅因他人成绩变化而名次改变**的选手（标记 `direct:false`，其有效链差异为空）；
    - 一个签名 `token`，绑定「预演时修订号 + 规范化操作集合」。
 3. 核对无误后再调用**确认**，携带相同的 `expectedRevision` 与预演返回的 `token`：
-   - 赛事已被他人修订（修订号不一致）→ **HTTP 409 并返回 `currentRevision`**，必须重新预演；
+   - 赛事已被他人修订（修订号不一致；**含罚时裁决的登记/撤销**）→ **HTTP 409 并返回 `currentRevision`**，
+     必须重新预演（裁决变更同样使旧预演令牌失效）；
    - token 缺失/非法/服务重启后失效、或确认时再次整案校验发现打卡缺失/已作废等 → **400 整案拒绝**；
    - 成功则**全部变更与逐条审计在一个事务内一次性落库，修订号只推进一次**，并返回最新成绩；
    - 任何失败都**不会部分生效**。
@@ -278,13 +392,15 @@ curl -s http://localhost:3000/api/publications/3
 
 ## 发布冻结与赛事修订
 
-- 每次关卡设置、组别赛道/归属变更、停表区间变动、批量导入（确有新增时）、作废/更正、发布都会推进赛事
-  `revision` 修订号；导入全部为幂等跳过、停表或组别保存后内容无变化时为只读操作，不推进修订号。
-- 导入、发布、停表配置与组别配置必须在请求中携带 `expectedRevision`；与当前修订不一致时返回
-  **HTTP 409 及 `currentRevision`**（前端提示刷新），避免覆盖他人更改。
-- 发布将**关卡配置 + 组别赛道与归属 + 停表区间 + 全部有效读数（作废读数除外）+ 当次成绩
-  （含净耗时与两种名次）**整体快照写入 `publication` / `published_result` 表，版本号递增；
-  历史版只读，后续更正/作废/重导/停表或组别调整**不修改任何历史版**。
+- 每次关卡设置、组别赛道/归属变更、停表区间变动、**罚时裁决登记/撤销（确有变化时）**、批量导入（确有新增时）、
+  作废/更正、发布都会推进赛事 `revision` 修订号；导入全部为幂等跳过、停表或组别保存后内容无变化、
+  裁决全部为幂等重传/重撤时为只读操作，不推进修订号。
+- 导入、发布、停表配置、组别配置与**罚时裁决批处理**必须在请求中携带 `expectedRevision`；与当前修订不一致时
+  返回 **HTTP 409 及 `currentRevision`**（前端提示刷新），避免覆盖他人更改。
+- 发布将**关卡配置 + 组别赛道与归属 + 停表区间 + 全部罚时裁决（含已撤销留痕）+ 全部有效读数（作废读数除外）
+  + 当次成绩（含有效罚时、正式耗时 officialElapsed 与两种名次）**整体快照写入 `publication` /
+  `published_result` 表，版本号递增；历史版只读，后续更正/作废/重导/停表或组别调整/**罚时登记或撤销**
+  **不修改任何历史版**。
 - 批量导入校验：
   - 秒数必须为非负整数，出现**负秒数 → 整批拒绝**；
   - **同号异「原始内容」→ 整批拒绝**：同记录号判定以该记录号**首次入库时**的
@@ -442,18 +558,22 @@ curl -s -X POST http://localhost:3000/api/appeals/confirm \
 
 ## 页面说明
 
-- **成绩排名**：实时成绩、全场名次与组内名次（均含并列）、所属组别、状态、失败组/超时说明、
-  原始耗时/停表扣减/净耗时、每人的最早有效链；可按组别/默认赛道筛选查看组内成绩。
+- **成绩排名**：实时成绩、全场名次与组内名次（按正式耗时、均含并列）、所属组别、状态、失败组/超时说明、
+  原始耗时/停表扣减/净耗时/有效罚时/正式耗时、每人的最早有效链；可按组别/默认赛道筛选查看组内成绩。
 - **组别赛道**：维护各组别的有序关卡组、可替代点位与关卡/终点截止，并按号码布指定选手组别
   （未分组者走默认赛道）；客户端即时校验（未知组别/重复归属/空替代点位整次拒绝），保存携带修订号原子生效。
 - **停表区间**：整体维护距发枪秒数表示的停表区间（客户端即时校验、预览合并后的并集），保存携带修订号。
+- **罚时裁决**：混合批量登记（唯一裁决号/已有号码布/正整数秒数/原因）与撤销（裁决号/原因）；
+  客户端即时校验、库中裁决即时提示（同内容幂等/已撤销不可复用），整批提交携带修订号原子生效；
+  可按号码布查看裁决登记册与逐条登记/撤销审计。
 - **整案申诉**：按号码布挑选多条打卡组成同一申诉，逐条作废/更正并填原因；先预演查看所有受影响选手
-  （含名次联动者）处理前后的成绩（原始/净耗时）、全场与组内名次、失败原因与有效链差异，再一次性原子确认。
+  （含名次联动者）处理前后的成绩（原始/净耗时/有效罚时/正式耗时）、全场与组内名次、失败原因与有效链差异，
+  再一次性原子确认（裁决变更会令旧预演失效）。
 - **争议复核**：按号码布查看打卡，执行单条作废/更正并查看完整操作留痕。
 - **打卡导入**：批量粘贴导入，展示整批校验结果。
 - **关卡设置**：维护起点/终点、终点截止、顺序关卡组、组内替代点位与组截止（默认赛道，未分组者使用）。
-- **发布冻结**：发布新版本、浏览各历史冻结版的关卡/组别赛道与归属/停表区间/读数/成绩
-  （含冻结的净耗时与两种名次）。
+- **发布冻结**：发布新版本、浏览各历史冻结版的关卡/组别赛道与归属/停表区间/**罚时裁决**/读数/成绩
+  （含冻结的有效罚时、正式耗时与两种名次）。
 
 ## 主要 API
 
@@ -465,30 +585,38 @@ curl -s -X POST http://localhost:3000/api/appeals/confirm \
 | POST | `/api/divisions` | 整体替换组别赛道与归属（需 `expectedRevision`；未知组别/重复归属/空替代点位 400 整次拒绝，过期 409；无变化不推进修订） |
 | GET | `/api/stoppages` | 当前停表区间并集与修订号 |
 | POST | `/api/stoppages` | 整体替换停表区间（需 `expectedRevision`；无效区间 400 整次拒绝，过期 409） |
+| GET | `/api/penalties?bib=&status=` | 全部罚时裁决（含已撤销留痕）与逐条审计，可按号码布/状态筛选 |
+| POST | `/api/penalties/batch` | 批量登记/撤销罚时（需 `expectedRevision`；批内冲突/未知选手或裁决/非法秒数/编号复用 400 整批拒绝不留审计，过期 409；同内容重传/同因重撤幂等不推进修订，实际变更原子落库只推进一次） |
 | POST | `/api/punches/import` | 批量导入（按首次入库原始读数幂等；冲突整批拒绝，409 过期 / 400 拒绝） |
 | GET | `/api/punches?bib=` | 打卡与审计记录 |
 | POST | `/api/punches/:id/void` | 作废（reason 必填） |
 | POST | `/api/punches/:id/correct` | 更正（newPoint/newSeconds/reason） |
 | POST | `/api/appeals/preview` | 整案预演（只读，返回处理前后对比与签名 token；409 过期 / 400 整案无效） |
 | POST | `/api/appeals/confirm` | 整案确认（expectedRevision + token；原子落库只推进一次修订，409 需重新预演） |
-| GET | `/api/results` | 当前实时成绩排名（含 `elapsed`/`netElapsed`、全场名次 `rank` 与组内名次 `groupRank`、所属组别） |
-| POST | `/api/publications` | 发布冻结快照（含组别赛道与归属、停表区间、两种名次，需 `expectedRevision`） |
-| GET | `/api/publications` / `/api/publications/:version` | 版本列表 / 历史冻结版详情（含 `stoppages` 与 `divisions`） |
+| GET | `/api/results` | 当前实时成绩排名（含 `elapsed`/`netElapsed`、`penaltySecs`/`officialElapsed`、全场名次 `rank` 与组内名次 `groupRank`、所属组别；另返回全部裁决 `penalties`） |
+| POST | `/api/publications` | 发布冻结快照（含组别赛道与归属、停表区间、罚时裁决、正式耗时与两种名次，需 `expectedRevision`） |
+| GET | `/api/publications` / `/api/publications/:version` | 版本列表 / 历史冻结版详情（含 `stoppages`、`divisions` 与 `penalties`） |
 
 ## 目录结构
 
 ```
 server/            Express + better-sqlite3 后端
-  src/index.mjs    API 路由（含整案申诉 /api/appeals/preview|confirm、停表区间 /api/stoppages、组别赛道 /api/divisions）
+  src/index.mjs    API 路由（含整案申诉 /api/appeals/preview|confirm、停表区间 /api/stoppages、
+                    组别赛道 /api/divisions、罚时裁决 /api/penalties/batch）
   src/appeals.mjs  整案操作校验、只读内存预演、签名令牌与原子提交
-  src/scoring.mjs  按所属赛道的最早有效链、区间并集/交长、净耗时、全场名次与组内名次（支持内存读数核算）
-  src/db.mjs       SQLite 连接/建表/修订号/旧库迁移（停表列回填、组别表与名次数列回填）
-  src/seed.mjs     演示数据（含一段天气停表区间 500–600s、ME/WE 示范组别赛道与三名已归属选手）
-  src/schema.sql   数据库表结构（stoppage_interval、division*、runner_division、
-                   publication.stoppages_json/divisions_json、published_result.net_elapsed/group_rank）
-  e2e-test.mjs     端到端断言（168 项，覆盖核算/整批拒绝/修订锁/冻结/重导语义/整案申诉/停表净耗时/组别赛道与组内名次）
+  src/penalties.mjs 罚时裁决整批规范化/幂等与冲突校验、单事务原子落库与逐条审计
+  src/scoring.mjs  按所属赛道的最早有效链、区间并集/交长、净耗时、有效罚时合计/正式耗时、
+                    全场名次与组内名次（按正式耗时，支持内存读数核算）
+  src/db.mjs       SQLite 连接/建表/修订号/旧库迁移（停表列回填、组别表与名次数列回填、罚时表与正式耗时回填）
+  src/seed.mjs     演示数据（含一段天气停表区间 500–600s、ME/WE 示范组别赛道与三名已归属选手、
+                    一条已撤销罚时裁决 J001 留痕样例）
+  src/schema.sql   数据库表结构（stoppage_interval、division*、runner_division、penalty/penalty_audit、
+                   publication.stoppages_json/divisions_json/penalties_json、
+                   published_result.net_elapsed/penalty_secs/official_elapsed/group_rank）
+  e2e-test.mjs     端到端断言（221 项，覆盖核算/整批拒绝/修订锁/冻结/重导语义/整案申诉/停表净耗时/
+                    组别赛道与组内名次/罚时裁决与正式耗时名次）
 web/               React + Vite 前端
-  src/components/  八个功能页面（成绩/组别赛道/停表区间/整案申诉/单条复核/导入/设置/发布）
+  src/components/  九个功能页面（成绩/组别赛道/停表区间/罚时裁决/整案申诉/单条复核/导入/设置/发布）
 Dockerfile         多阶段构建（前端构建 + 后端 + 运行镜像）
 docker-compose.yml 一键启动、建表、初始化数据，端口 3000
 ```
@@ -500,6 +628,7 @@ docker-compose.yml 一键启动、建表、初始化数据，端口 3000
 rm -f data/orienteering.db*
 SEED=1 node server/src/index.mjs
 
-# 终端 2：运行 168 项断言（含整案申诉预演/确认、停表净耗时、组别赛道与组内名次、冻结版不可变）
+# 终端 2：运行 221 项断言（含整案申诉预演/确认、停表净耗时、组别赛道与组内名次、
+# 罚时裁决批量登记/撤销/幂等/正式耗时名次/冻结版不可变）
 node server/e2e-test.mjs http://localhost:3000
 ```

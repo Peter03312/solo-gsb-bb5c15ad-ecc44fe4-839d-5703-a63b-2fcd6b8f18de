@@ -160,6 +160,8 @@ const slimResult = (r) => ({
   elapsed: r.elapsed ?? null,
   netElapsed: r.netElapsed ?? null,
   stoppedSecs: r.stoppedSecs ?? null,
+  penaltySecs: r.penaltySecs ?? 0,
+  officialElapsed: r.officialElapsed ?? null,
   rank: r.rank ?? null,
   groupRank: r.groupRank ?? null,
   divisionCode: r.divisionCode ?? null,
@@ -185,6 +187,7 @@ function resultChanged(a, b) {
     a.status !== b.status ||
     (a.elapsed ?? null) !== (b.elapsed ?? null) ||
     (a.netElapsed ?? null) !== (b.netElapsed ?? null) ||
+    (a.officialElapsed ?? null) !== (b.officialElapsed ?? null) ||
     (a.rank ?? null) !== (b.rank ?? null) ||
     (a.groupRank ?? null) !== (b.groupRank ?? null) ||
     (a.failAt ?? null) !== (b.failAt ?? null) ||

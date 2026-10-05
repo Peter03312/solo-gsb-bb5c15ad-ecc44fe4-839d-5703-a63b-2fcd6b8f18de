@@ -42,4 +42,8 @@ export const api = {
     request('/api/appeals/preview', { method: 'POST', body: JSON.stringify(payload) }),
   appealConfirm: payload =>
     request('/api/appeals/confirm', { method: 'POST', body: JSON.stringify(payload) }),
+  penalties: (bib, status) =>
+    request(`/api/penalties${bib || status ? `?${new URLSearchParams({ ...(bib ? { bib } : {}), ...(status ? { status } : {}) })}` : ''}`),
+  penaltyBatch: payload =>
+    request('/api/penalties/batch', { method: 'POST', body: JSON.stringify(payload) }),
 };
